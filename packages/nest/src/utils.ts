@@ -1,4 +1,5 @@
 import type { AnyContractRouter, HTTPPath } from '@orpc/contract'
+import type { FastifyReply } from 'fastify'
 import { toHttpPath } from '@orpc/client/standard'
 import { ContractProcedure, isContractProcedure } from '@orpc/contract'
 import { standardizeHTTPPath } from '@orpc/openapi-client/standard'
@@ -8,6 +9,14 @@ export function toNestPattern(path: HTTPPath): string {
   return standardizeHTTPPath(path)
     .replace(/\/\{\+([^}]+)\}/g, '/*$1')
     .replace(/\/\{([^}]+)\}/g, '/:$1')
+}
+
+export function isExpressResponse(res: any): res is Response {
+  return 'status' in res && 'send' in res
+}
+
+export function isFastifyReply(res: any): res is FastifyReply {
+  return 'code' in res && 'send' in res
 }
 
 export type PopulatedContractRouterPaths<T extends AnyContractRouter>

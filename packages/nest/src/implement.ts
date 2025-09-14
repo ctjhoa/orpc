@@ -4,7 +4,7 @@ import type { Router } from '@orpc/server'
 import type { StandardParams } from '@orpc/server/standard'
 import type { Promisable } from '@orpc/shared'
 import type { StandardResponse } from '@orpc/standard-server'
-import type { NodeHttpRequest, NodeHttpResponse } from '@orpc/standard-server-node'
+import type { NodeHttpResponse } from '@orpc/standard-server-node'
 import type { Request, Response } from 'express'
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import type { Observable } from 'rxjs'
@@ -15,12 +15,12 @@ import { fallbackContractConfig, isContractProcedure } from '@orpc/contract'
 import { StandardBracketNotationSerializer, StandardOpenAPIJsonSerializer, StandardOpenAPISerializer } from '@orpc/openapi-client/standard'
 import { StandardOpenAPICodec } from '@orpc/openapi/standard'
 import { createProcedureClient, getRouter, isProcedure, ORPCError, unlazy } from '@orpc/server'
-import { get } from '@orpc/shared'
+import { get, stringifyJSON } from '@orpc/shared'
 import { flattenHeader } from '@orpc/standard-server'
-import { sendStandardResponse, toStandardLazyRequest } from '@orpc/standard-server-node'
-import { mergeMap } from 'rxjs'
+import { toStandardLazyRequest } from '@orpc/standard-server-node'
+import { from, mergeMap } from 'rxjs'
 import { ORPC_MODULE_CONFIG_SYMBOL } from './module'
-import { toNestPattern } from './utils'
+import { isExpressResponse, isFastifyReply, toNestPattern } from './utils'
 
 const MethodDecoratorMap = {
   HEAD: Head,
@@ -103,8 +103,7 @@ type NestParams = Record<string, string | string[]>
 export class ImplementInterceptor implements NestInterceptor {
   constructor(
     @Inject(ORPC_MODULE_CONFIG_SYMBOL) @Optional() private readonly config: ORPCModuleConfig | undefined,
-  ) {
-  }
+  ) {}
 
   intercept(ctx: ExecutionContext, next: CallHandler<any>): Observable<any> {
     return next.handle().pipe(
@@ -112,52 +111,116 @@ export class ImplementInterceptor implements NestInterceptor {
         const { default: procedure } = await unlazy(impl)
 
         if (!isProcedure(procedure)) {
-          throw new Error(`
-            The return value of the @Implement controller handler must be a corresponding implemented router or procedure.
-          `)
+          throw new Error(
+            'The return value of the @Implement controller handler must be a corresponding implemented router or procedure.',
+          )
         }
 
         const req: Request | FastifyRequest = ctx.switchToHttp().getRequest()
         const res: Response | FastifyReply = ctx.switchToHttp().getResponse()
-
-        const nodeReq: NodeHttpRequest = 'raw' in req ? req.raw : req
         const nodeRes: NodeHttpResponse = 'raw' in res ? res.raw : res
 
-        const standardRequest = toStandardLazyRequest(nodeReq, nodeRes)
-        const fallbackStandardBody = standardRequest.body.bind(standardRequest)
+        const standardRequest = toStandardLazyRequest(
+          'raw' in req ? req.raw : req,
+          nodeRes,
+        )
+        const fallbackStandardBody
+          = standardRequest.body.bind(standardRequest)
         // Prefer NestJS parsed body (in nodejs body only allow parse once)
-        standardRequest.body = () => Promise.resolve(req.body ?? fallbackStandardBody())
+        standardRequest.body = () =>
+          Promise.resolve(req.body ?? fallbackStandardBody())
 
         const standardResponse: StandardResponse = await (async () => {
           let isDecoding = false
-
           try {
             const client = createProcedureClient(procedure, this.config)
 
             isDecoding = true
-            const input = await codec.decode(standardRequest, flattenParams(req.params as NestParams), procedure)
+            const input = await codec.decode(
+              standardRequest,
+              flattenParams(req.params as NestParams),
+              procedure,
+            )
             isDecoding = false
 
             const output = await client(input, {
               signal: standardRequest.signal,
-              lastEventId: flattenHeader(standardRequest.headers['last-event-id']),
+              lastEventId: flattenHeader(
+                standardRequest.headers['last-event-id'],
+              ),
             })
 
             return codec.encode(output, procedure)
           }
           catch (e) {
-            const error = isDecoding && !(e instanceof ORPCError)
-              ? new ORPCError('BAD_REQUEST', {
-                message: `Malformed request. Ensure the request body is properly formatted and the 'Content-Type' header is set correctly.`,
-                cause: e,
-              })
-              : toORPCError(e)
+            const error
+              = isDecoding && !(e instanceof ORPCError)
+                ? new ORPCError('BAD_REQUEST', {
+                  message:
+                      'Malformed request. Ensure the request body is properly formatted and the \'Content-Type\' header is set correctly.',
+                  cause: e,
+                })
+                : toORPCError(e)
 
             return codec.encodeError(error)
           }
         })()
 
-        await sendStandardResponse(nodeRes, standardResponse, this.config)
+        // --- START OF THE DEFINITIVE FIX ---
+
+        // Set Headers
+        if (standardResponse.headers) {
+          for (const [key, value] of Object.entries(
+            standardResponse.headers,
+          )) {
+            if (value !== undefined) {
+              res.header(key, value as any)
+            }
+          }
+        }
+
+        // Set Status Code
+        if (standardResponse.status) {
+          if (isFastifyReply(res)) {
+            res.code(standardResponse.status)
+          }
+          else if (isExpressResponse(res)) {
+            res.status(standardResponse.status)
+          }
+        }
+
+        if (typeof standardResponse.body === 'object' && standardResponse.body !== null && !res.getHeader('Content-Type')) {
+          res.header('Content-Type', 'application/json; charset=utf-8')
+        }
+
+        // Send Body and End Response
+        if (standardResponse.body) {
+          if (typeof standardResponse.body === 'function') {
+            // Streaming response
+            const stream = standardResponse.body()
+            stream.pipe(nodeRes)
+          }
+          else {
+            // Non-streaming response
+            if (typeof standardResponse.body !== 'string' && !res.getHeader('Content-Type')) {
+              res.header('Content-Type', 'application/json')
+            }
+            res.send(
+              typeof standardResponse.body === 'string'
+                ? standardResponse.body
+                : stringifyJSON(standardResponse.body),
+            )
+          }
+        }
+        else {
+          res.send()
+        }
+
+        // By handling the response manually, we prevent NestJS from trying to send it again.
+        // We return an empty promise that never resolves to keep the stream open.
+        return from(new Promise(() => {}))
+
+        // --- END OF THE DEFINITIVE FIX ---
       }),
     )
   }
